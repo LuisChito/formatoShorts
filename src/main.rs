@@ -3,16 +3,20 @@
 // (whisper.cpp integrado en ffmpeg). También puede generar solo el .srt.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod subtitulos;
+
 use eframe::egui;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use subtitulos as st;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
@@ -260,45 +264,12 @@ impl Idioma {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-enum Tamano {
-    Pequeno,
-    Mediano,
-    Grande,
-}
-
-impl Tamano {
-    /// (tamaño de fuente en unidades de libass, máx. caracteres por subtítulo)
-    fn valores(self) -> (u32, u32) {
-        match self {
-            Tamano::Pequeno => (10, 32),
-            Tamano::Mediano => (13, 24),
-            Tamano::Grande => (16, 16),
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum PosSub {
-    Abajo,
-    Centro,
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum ColorSub {
-    Blanco,
-    Amarillo,
-}
-
 #[derive(Clone)]
 struct OpcionesSubs {
     activar: bool,
     modelo: Modelo,
     idioma: Idioma,
-    tamano: Tamano,
-    posicion: PosSub,
-    color: ColorSub,
-    mayusculas: bool,
+    aspecto: st::Opciones,
     guardar_srt: bool,
 }
 
@@ -438,6 +409,11 @@ struct App {
     texturas: HashMap<PathBuf, egui::TextureHandle>,
     generacion: Arc<AtomicU64>,
     aviso: Option<String>,
+    // Vista previa del estilo de subtítulos
+    previa_imagen: Arc<Mutex<Option<egui::ColorImage>>>,
+    previa_textura: Option<egui::TextureHandle>,
+    previa_clave: String,
+    previa_ocupada: Arc<AtomicBool>,
 }
 
 // ───────────────────────────── Utilidades ─────────────────────────────
@@ -579,20 +555,20 @@ fn mostrar_en_explorador(p: &Path) {
         .spawn();
 }
 
-fn construir_filtro(config: &Config, srt_relativo: Option<&str>) -> String {
+fn construir_filtro(config: &Config, ass_relativo: Option<&str>) -> String {
     let (w, h) = config.resolucion.dims();
     let base = match config.modo {
         Modo::Recortar => format!(
-            "[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,\
+            "[0:v]format=yuv420p,scale={w}:{h}:force_original_aspect_ratio=increase,\
              crop={w}:{h}:(iw-ow)*{px:.3}:(ih-oh)/2,setsar=1",
             px = config.posicion_x
         ),
         Modo::BarrasNegras => format!(
-            "[0:v]scale={w}:{h}:force_original_aspect_ratio=decrease,\
+            "[0:v]format=yuv420p,scale={w}:{h}:force_original_aspect_ratio=decrease,\
              pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1"
         ),
         Modo::FondoDesenfocado => format!(
-            "[0:v]split=2[bg][fg];\
+            "[0:v]format=yuv420p,split=2[bg][fg];\
              [bg]scale={wb}:{hb}:force_original_aspect_ratio=increase,crop={wb}:{hb},boxblur=8:3,scale={w}:{h}[bg2];\
              [fg]scale={w}:{h}:force_original_aspect_ratio=decrease[fg2];\
              [bg2][fg2]overlay=(W-w)/2:(H-h)/2,setsar=1",
@@ -600,24 +576,8 @@ fn construir_filtro(config: &Config, srt_relativo: Option<&str>) -> String {
             hb = h / 4
         ),
     };
-    let subs = match srt_relativo {
-        Some(srt) => {
-            let s = &config.subs;
-            let (fuente, _) = s.tamano.valores();
-            let (alineacion, margen) = match s.posicion {
-                PosSub::Abajo => (2, 70),
-                PosSub::Centro => (5, 0),
-            };
-            let color = match s.color {
-                ColorSub::Blanco => "&H00FFFFFF",
-                ColorSub::Amarillo => "&H0000FFFF",
-            };
-            format!(
-                ",subtitles=filename={srt}:force_style='Fontname=Arial,FontSize={fuente},Bold=1,\
-                 PrimaryColour={color},OutlineColour=&H00000000,BorderStyle=1,Outline=1.6,Shadow=0.8,\
-                 Alignment={alineacion},MarginV={margen},MarginL=12,MarginR=12'"
-            )
-        }
+    let subs = match ass_relativo {
+        Some(ass) => format!(",ass=filename={ass}:fontsdir=fonts"),
         None => String::new(),
     };
     format!("{base}{subs},format=yuv420p[v]")
@@ -642,65 +602,6 @@ fn ruta_salida(entrada: &Path, config: &Config, sufijo: &str, ext: &str) -> Path
     ruta
 }
 
-fn parsear_marca(t: &str) -> Option<f64> {
-    let (hms, ms) = t.trim().split_once([',', '.'])?;
-    let p: Vec<f64> = hms
-        .split(':')
-        .map(|x| x.parse().ok())
-        .collect::<Option<_>>()?;
-    if p.len() != 3 {
-        return None;
-    }
-    Some(p[0] * 3600.0 + p[1] * 60.0 + p[2] + ms.parse::<f64>().ok()? / 1000.0)
-}
-
-fn formatear_marca(seg: f64) -> String {
-    let ms_total = (seg.max(0.0) * 1000.0).round() as u64;
-    let (h, resto) = (ms_total / 3_600_000, ms_total % 3_600_000);
-    let (m, resto) = (resto / 60_000, resto % 60_000);
-    format!("{h:02}:{m:02}:{:02},{:03}", resto / 1000, resto % 1000)
-}
-
-/// Limpia el .srt de whisper: numera desde 1, opcionalmente pasa a mayúsculas
-/// y desplaza las marcas de tiempo (para que coincidan con el video original).
-fn procesar_srt(contenido: &str, mayusculas: bool, desplazamiento: f64) -> String {
-    let mut salida = String::new();
-    let mut n = 0;
-    for bloque in contenido.replace("\r\n", "\n").split("\n\n") {
-        let lineas: Vec<&str> = bloque.lines().filter(|l| !l.trim().is_empty()).collect();
-        let Some(pos) = lineas.iter().position(|l| l.contains("-->")) else {
-            continue;
-        };
-        let Some((a, b)) = lineas[pos].split_once("-->") else {
-            continue;
-        };
-        let (Some(a), Some(b)) = (parsear_marca(a), parsear_marca(b)) else {
-            continue;
-        };
-        let texto: Vec<String> = lineas[pos + 1..]
-            .iter()
-            .map(|l| {
-                if mayusculas {
-                    l.trim().to_uppercase()
-                } else {
-                    l.trim().to_string()
-                }
-            })
-            .collect();
-        if texto.is_empty() {
-            continue;
-        }
-        n += 1;
-        salida.push_str(&format!(
-            "{n}\n{} --> {}\n{}\n\n",
-            formatear_marca(a + desplazamiento),
-            formatear_marca(b + desplazamiento),
-            texto.join("\n")
-        ));
-    }
-    salida
-}
-
 // ───────────────────────────── Proceso ─────────────────────────────
 
 impl App {
@@ -721,30 +622,9 @@ impl App {
             });
         }
         // Elegir por defecto el mejor modelo ya descargado
-        let modelo = [Modelo::Turbo, Modelo::Small, Modelo::Base]
-            .into_iter()
-            .find(|m| m.instalado())
-            .unwrap_or(Modelo::Base);
+        let modelo = mejor_modelo();
         let mut app = Self {
-            config: Config {
-                que: QueGenerar::Video,
-                modo: Modo::FondoDesenfocado,
-                resolucion: Resolucion::R1080,
-                posicion_x: 0.5,
-                calidad_crf: 20,
-                aceleracion: Aceleracion::Automatica,
-                carpeta_salida: None,
-                subs: OpcionesSubs {
-                    activar: false,
-                    modelo,
-                    idioma: Idioma::Es,
-                    tamano: Tamano::Mediano,
-                    posicion: PosSub::Abajo,
-                    color: ColorSub::Blanco,
-                    mayusculas: false,
-                    guardar_srt: true,
-                },
-            },
+            config: config_por_defecto(modelo),
             compartido: Arc::new(Mutex::new(Compartido::default())),
             descarga: Arc::new(Mutex::new(Descarga::Nada)),
             ffmpeg_ok,
@@ -759,6 +639,10 @@ impl App {
             texturas: HashMap::new(),
             generacion: Arc::new(AtomicU64::new(0)),
             aviso: None,
+            previa_imagen: Arc::new(Mutex::new(None)),
+            previa_textura: None,
+            previa_clave: String::new(),
+            previa_ocupada: Arc::new(AtomicBool::new(false)),
         };
         if let Ok(t) = std::fs::read_to_string(archivo_ultima_carpeta()) {
             let p = PathBuf::from(t.trim());
@@ -1079,6 +963,97 @@ fn ffmpeg_con_rango(
     cmd
 }
 
+/// Transcribe el audio con tiempos por palabra alineados con la voz:
+/// 1) detecta silencios, 2) los quita y transcribe solo la voz (whisper es mucho
+/// más preciso así), 3) devuelve cada palabra a su tiempo real en el clip.
+#[allow(clippy::too_many_arguments)]
+fn transcribir(
+    compartido: &Arc<Mutex<Compartido>>,
+    idx: usize,
+    entrada: &Path,
+    inicio: Option<f64>,
+    largo: Option<f64>,
+    duracion: f64,
+    config: &Config,
+    base: &Path,
+    json_rel: &str,
+    ctx: &egui::Context,
+) -> Result<Vec<st::Palabra>, String> {
+    let s = &config.subs;
+    if !s.modelo.instalado() {
+        return Err("Falta descargar el modelo de subtítulos".into());
+    }
+    let _ = std::fs::create_dir_all(base.join("tmp"));
+    let json_abs = base.join(json_rel);
+    let _ = std::fs::remove_file(&json_abs);
+
+    // 1) Detectar silencios (solo audio, muy rápido)
+    if let Some(t) = compartido.lock().unwrap().trabajos.get_mut(idx) {
+        t.estado = Estado::Procesando("Analizando la voz", 0.0);
+    }
+    ctx.request_repaint();
+    let mut cmd = ffmpeg_con_rango(entrada, inicio, largo, None);
+    cmd.args([
+        "-vn",
+        "-map",
+        "0:a:0",
+        "-af",
+        "silencedetect=noise=-35dB:d=0.35",
+        "-f",
+        "null",
+        "-",
+    ])
+    .args(["-nostats", "-loglevel", "info"])
+    .stdout(Stdio::null())
+    .stderr(Stdio::piped());
+    let log = cmd
+        .output()
+        .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+        .unwrap_or_default();
+    let tramos = st::tramos_con_voz(&log, duracion);
+    let voz: f64 = tramos.iter().map(|(a, b)| b - a).sum();
+    if tramos.is_empty() {
+        return Ok(Vec::new());
+    }
+    // Si casi no hay silencios (p. ej. música de fondo), se transcribe todo tal cual.
+    let recortar = tramos.len() > 1 || voz < duracion - 0.3;
+
+    // 2) Transcribir solo la voz, con tiempos por palabra (max_len=1)
+    let previo = if recortar {
+        format!(
+            "aresample=16000,asetnsamples=n=160:p=0,aselect='{}',asetpts=N/SR/TB,",
+            st::expresion_aselect(&tramos)
+        )
+    } else {
+        String::new()
+    };
+    let filtro = format!(
+        "{previo}whisper=model=models/{}:language={}:queue=20:format=json:destination={json_rel}:max_len=1",
+        s.modelo.archivo(),
+        s.idioma.codigo()
+    );
+    let mut cmd = ffmpeg_con_rango(entrada, inicio, largo, None);
+    cmd.current_dir(base)
+        .args(["-vn", "-map", "0:a:0", "-af", &filtro, "-f", "null", "-"]);
+    let r = ejecutar_ffmpeg(
+        compartido,
+        idx,
+        cmd,
+        if recortar { voz } else { duracion },
+        "Transcribiendo audio",
+        ctx,
+    );
+    let json = std::fs::read_to_string(&json_abs).unwrap_or_default();
+    let _ = std::fs::remove_file(&json_abs);
+    r.map_err(|e| format!("No se pudo transcribir (¿el video tiene audio?): {e}"))?;
+
+    // 3) Tiempos reales
+    Ok(st::leer_palabras(
+        &json,
+        if recortar { &tramos } else { &[] },
+    ))
+}
+
 fn convertir(
     compartido: &Arc<Mutex<Compartido>>,
     idx: usize,
@@ -1095,56 +1070,46 @@ fn convertir(
     // Las rutas dentro de los filtros de ffmpeg no pueden llevar "C:", así que
     // ffmpeg se ejecuta dentro de la carpeta de la app y usa rutas relativas.
     let base = carpeta_app();
-    let srt_rel = format!("tmp/subs_{}_{idx}.srt", std::process::id());
-    let srt_abs = base.join(&srt_rel);
-    let mut srt_crudo: Option<String> = None;
+    let id = format!("{}_{idx}", std::process::id());
+    let json_rel = format!("tmp/palabras_{id}.json");
+    let ass_rel = format!("tmp/subs_{id}.ass");
+    let ass_abs = base.join(&ass_rel);
+    let mut palabras: Vec<st::Palabra> = Vec::new();
 
     if config.necesita_whisper() {
-        let s = &config.subs;
-        if !s.modelo.instalado() {
-            return Err("Falta descargar el modelo de subtítulos".into());
-        }
-        let _ = std::fs::create_dir_all(base.join("tmp"));
-        let _ = std::fs::remove_file(&srt_abs);
-        let (_, max_len) = s.tamano.valores();
-        let max_len = if solo_subs { 42 } else { max_len };
-        let filtro = format!(
-            "whisper=model=models/{}:language={}:queue=20:format=srt:destination={srt_rel}:max_len={max_len}",
-            s.modelo.archivo(),
-            s.idioma.codigo()
-        );
-        let mut cmd = ffmpeg_con_rango(entrada, inicio, largo, None);
-        cmd.current_dir(&base)
-            .args(["-vn", "-map", "0:a:0", "-af", &filtro, "-f", "null", "-"]);
-        let r = ejecutar_ffmpeg(compartido, idx, cmd, duracion, "Transcribiendo audio", ctx);
-        let contenido = std::fs::read_to_string(&srt_abs).unwrap_or_default();
-        let _ = std::fs::remove_file(&srt_abs);
-        r.map_err(|e| format!("No se pudo transcribir (¿el video tiene audio?): {e}"))?;
+        palabras = transcribir(
+            compartido, idx, entrada, inicio, largo, duracion, config, &base, &json_rel, ctx,
+        )?;
         if compartido.lock().unwrap().cancelar {
             return Err("Cancelado".into());
-        }
-        if contenido.contains("-->") {
-            srt_crudo = Some(contenido);
         }
     }
 
     // ── Modo «solo subtítulos»: guardar el .srt y terminar ──
     if solo_subs {
-        let crudo = srt_crudo.ok_or("No se detectó voz en el audio")?;
+        if palabras.is_empty() {
+            return Err("No se detectó voz en el audio".into());
+        }
         // Con recorte, las marcas se desplazan para que coincidan con el video original.
-        let srt = procesar_srt(&crudo, config.subs.mayusculas, inicio.unwrap_or(0.0));
+        let srt = st::generar_srt(
+            &palabras,
+            config.subs.aspecto.mayusculas,
+            inicio.unwrap_or(0.0),
+        );
         let salida = ruta_salida(entrada, config, "", "srt");
         std::fs::write(&salida, srt).map_err(|e| format!("No se pudo guardar el .srt: {e}"))?;
-        return Ok((salida, String::new()));
+        return Ok((salida, format!("{} palabras", palabras.len())));
     }
 
     // ── Modo video ──
     let salida = ruta_salida(entrada, config, "_9x16", "mp4");
-    let srt_video = srt_crudo.map(|c| procesar_srt(&c, config.subs.mayusculas, 0.0));
-    if let Some(srt) = &srt_video {
-        std::fs::write(&srt_abs, srt).map_err(|e| e.to_string())?;
+    let con_subs = config.subs.activar && !palabras.is_empty();
+    if con_subs {
+        st::instalar_fuentes(&base);
+        std::fs::write(&ass_abs, st::generar_ass(&palabras, &config.subs.aspecto))
+            .map_err(|e| e.to_string())?;
     }
-    let filtro = construir_filtro(config, srt_video.as_ref().map(|_| srt_rel.as_str()));
+    let filtro = construir_filtro(config, con_subs.then_some(ass_rel.as_str()));
 
     // GPU primero (si está activada y disponible); si falla, se reintenta con CPU.
     let mut candidatos: Vec<Codificador> = match config.aceleracion {
@@ -1165,7 +1130,7 @@ fn convertir(
             .args(["-c:a", "aac", "-b:a", "192k"])
             .args(["-movflags", "+faststart"])
             .arg(&salida);
-        let etapa = match (srt_video.is_some(), cod == Codificador::Cpu) {
+        let etapa = match (con_subs, cod == Codificador::Cpu) {
             (true, false) => "Generando video con subtítulos (GPU)",
             (true, true) => "Generando video con subtítulos (CPU)",
             (false, false) => "Generando video (GPU)",
@@ -1185,10 +1150,11 @@ fn convertir(
         format!("{}; falló: {}", usado.nombre(), fallos.join(", "))
     };
 
-    if let (Some(srt), true, true) = (&srt_video, config.subs.guardar_srt, resultado.is_ok()) {
+    if con_subs && config.subs.guardar_srt && resultado.is_ok() {
+        let srt = st::generar_srt(&palabras, config.subs.aspecto.mayusculas, 0.0);
         let _ = std::fs::write(salida.with_extension("srt"), srt);
     }
-    let _ = std::fs::remove_file(&srt_abs);
+    let _ = std::fs::remove_file(&ass_abs);
 
     match resultado {
         Ok(()) => Ok((salida, nota)),
@@ -1361,30 +1327,152 @@ impl App {
             _ => {}
         }
 
-        let s = &mut self.config.subs;
+        let a = &mut self.config.subs.aspecto;
         if !solo_subs {
+            ui.add_space(4.0);
+            egui::ComboBox::from_label("Estilo")
+                .selected_text(a.estilo.nombre())
+                .show_ui(ui, |ui| {
+                    for e in [
+                        st::Estilo::Resaltado,
+                        st::Estilo::PalabraPorPalabra,
+                        st::Estilo::Frase,
+                    ] {
+                        ui.selectable_value(&mut a.estilo, e, e.nombre());
+                    }
+                });
+            egui::ComboBox::from_label("Fuente")
+                .selected_text(a.fuente.nombre())
+                .show_ui(ui, |ui| {
+                    for f in st::Fuente::TODAS {
+                        ui.selectable_value(&mut a.fuente, f, f.nombre());
+                    }
+                });
+            egui::ComboBox::from_label("Animación")
+                .selected_text(a.animacion.nombre())
+                .show_ui(ui, |ui| {
+                    for an in [
+                        st::Animacion::Pop,
+                        st::Animacion::Deslizar,
+                        st::Animacion::Fundido,
+                        st::Animacion::Ninguna,
+                    ] {
+                        ui.selectable_value(&mut a.animacion, an, an.nombre());
+                    }
+                });
+            if a.estilo != st::Estilo::Frase {
+                ui.horizontal(|ui| {
+                    ui.label("Resaltado:");
+                    for c in st::ColorResaltado::TODOS {
+                        let [r, g, b] = c.rgb();
+                        let texto =
+                            egui::RichText::new("⬤").color(egui::Color32::from_rgb(r, g, b));
+                        ui.selectable_value(&mut a.resaltado, c, texto)
+                            .on_hover_text(c.nombre());
+                    }
+                });
+            }
             ui.horizontal(|ui| {
                 ui.label("Tamaño:");
-                ui.selectable_value(&mut s.tamano, Tamano::Pequeno, "S");
-                ui.selectable_value(&mut s.tamano, Tamano::Mediano, "M");
-                ui.selectable_value(&mut s.tamano, Tamano::Grande, "L");
+                ui.selectable_value(&mut a.tamano, st::Tamano::Pequeno, "S");
+                ui.selectable_value(&mut a.tamano, st::Tamano::Mediano, "M");
+                ui.selectable_value(&mut a.tamano, st::Tamano::Grande, "L");
             });
             ui.horizontal(|ui| {
                 ui.label("Posición:");
-                ui.selectable_value(&mut s.posicion, PosSub::Abajo, "Abajo");
-                ui.selectable_value(&mut s.posicion, PosSub::Centro, "Centro");
+                ui.selectable_value(&mut a.posicion, st::Posicion::Arriba, "Arriba");
+                ui.selectable_value(&mut a.posicion, st::Posicion::Centro, "Centro");
+                ui.selectable_value(&mut a.posicion, st::Posicion::Abajo, "Abajo");
             });
-            ui.horizontal(|ui| {
-                ui.label("Color:");
-                ui.selectable_value(&mut s.color, ColorSub::Blanco, "Blanco");
-                ui.selectable_value(&mut s.color, ColorSub::Amarillo, "Amarillo");
-            });
+            ui.checkbox(&mut a.quitar_puntuacion, "Quitar comas y puntos");
         }
-        ui.checkbox(&mut s.mayusculas, "TEXTO EN MAYÚSCULAS");
+        ui.checkbox(&mut a.mayusculas, "TEXTO EN MAYÚSCULAS");
         if solo_subs {
             ui.small("Se guarda «nombre.srt» junto al video (o en la carpeta de salida).");
         } else {
-            ui.checkbox(&mut s.guardar_srt, "Guardar también el archivo .srt");
+            ui.checkbox(
+                &mut self.config.subs.guardar_srt,
+                "Guardar también el archivo .srt",
+            );
+            self.vista_previa(ui, ctx);
+        }
+    }
+
+    /// Renderiza (en segundo plano) un fotograma de ejemplo con el estilo elegido.
+    fn vista_previa(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        let a = &self.config.subs.aspecto;
+        let clave = format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            a.estilo as u8,
+            a.fuente as u8,
+            a.animacion as u8,
+            a.resaltado as u8,
+            a.tamano as u8,
+            a.posicion as u8,
+            a.mayusculas,
+            a.quitar_puntuacion
+        );
+        if clave != self.previa_clave && !self.previa_ocupada.swap(true, Ordering::SeqCst) {
+            self.previa_clave = clave;
+            let (aspecto, imagen, ocupada, ctx) = (
+                a.clone(),
+                Arc::clone(&self.previa_imagen),
+                Arc::clone(&self.previa_ocupada),
+                ctx.clone(),
+            );
+            thread::spawn(move || {
+                let base = carpeta_app();
+                st::instalar_fuentes(&base);
+                let _ = std::fs::create_dir_all(base.join("tmp"));
+                let ass = st::generar_ass(&st::palabras_de_ejemplo(), &aspecto);
+                let _ = std::fs::write(base.join("tmp/previa.ass"), ass);
+                let jpg = base.join("tmp/previa.jpg");
+                let _ = std::fs::remove_file(&jpg);
+                let _ = comando("ffmpeg")
+                    .current_dir(&base)
+                    .args([
+                        "-hide_banner",
+                        "-loglevel",
+                        "error",
+                        "-y",
+                        "-f",
+                        "lavfi",
+                        "-i",
+                    ])
+                    .arg("gradients=s=1080x1920:c0=0x3a6186:c1=0x89253e:d=2:speed=0")
+                    .args([
+                        "-vf",
+                        "ass=filename=tmp/previa.ass:fontsdir=fonts,scale=360:640",
+                    ])
+                    .args(["-ss", "0.9", "-frames:v", "1", "-q:v", "3"])
+                    .arg(&jpg)
+                    .output();
+                if let Ok(img) = image::open(&jpg) {
+                    let img = img.to_rgba8();
+                    let tam = [img.width() as usize, img.height() as usize];
+                    *imagen.lock().unwrap() =
+                        Some(egui::ColorImage::from_rgba_unmultiplied(tam, img.as_raw()));
+                }
+                ocupada.store(false, Ordering::SeqCst);
+                ctx.request_repaint();
+            });
+        }
+        if let Some(img) = self.previa_imagen.lock().unwrap().take() {
+            self.previa_textura =
+                Some(ctx.load_texture("previa_subs", img, egui::TextureOptions::LINEAR));
+        }
+        ui.add_space(4.0);
+        ui.small("Vista previa:");
+        match &self.previa_textura {
+            Some(t) => {
+                ui.add(egui::Image::new(egui::load::SizedTexture::new(
+                    t.id(),
+                    egui::vec2(135.0, 240.0),
+                )));
+            }
+            None => {
+                ui.small("generando…");
+            }
         }
     }
 
@@ -1884,7 +1972,97 @@ impl eframe::App for App {
     }
 }
 
+/// Configuración inicial (la usa la interfaz y el modo --cli).
+fn config_por_defecto(modelo: Modelo) -> Config {
+    Config {
+        que: QueGenerar::Video,
+        modo: Modo::FondoDesenfocado,
+        resolucion: Resolucion::R1080,
+        posicion_x: 0.5,
+        calidad_crf: 20,
+        aceleracion: Aceleracion::Automatica,
+        carpeta_salida: None,
+        subs: OpcionesSubs {
+            activar: false,
+            modelo,
+            idioma: Idioma::Es,
+            aspecto: st::Opciones {
+                estilo: st::Estilo::Resaltado,
+                fuente: st::Fuente::Luckiest,
+                animacion: st::Animacion::Pop,
+                resaltado: st::ColorResaltado::Amarillo,
+                tamano: st::Tamano::Mediano,
+                posicion: st::Posicion::Abajo,
+                mayusculas: true,
+                quitar_puntuacion: true,
+            },
+            guardar_srt: true,
+        },
+    }
+}
+
+/// Mejor modelo de whisper ya descargado (o el básico).
+fn mejor_modelo() -> Modelo {
+    [Modelo::Turbo, Modelo::Small, Modelo::Base]
+        .into_iter()
+        .find(|m| m.instalado())
+        .unwrap_or(Modelo::Base)
+}
+
+/// Modo línea de comandos:
+///   FormatoShorts.exe --cli <video> [--inicio T] [--fin T] [--sin-subs] [--solo-srt] [--cpu]
+fn modo_cli(args: &[String]) -> i32 {
+    let Some(entrada) = args.first() else {
+        eprintln!("Uso: --cli <video> [--inicio T] [--fin T] [--sin-subs] [--solo-srt] [--cpu]");
+        return 2;
+    };
+    let mut config = config_por_defecto(mejor_modelo());
+    config.subs.activar = true;
+    let mut trabajo = Trabajo::nuevo(PathBuf::from(entrada));
+    let mut it = args[1..].iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--inicio" => trabajo.inicio = it.next().cloned().unwrap_or_default(),
+            "--fin" => trabajo.fin = it.next().cloned().unwrap_or_default(),
+            "--sin-subs" => config.subs.activar = false,
+            "--solo-srt" => config.que = QueGenerar::SoloSubtitulos,
+            "--cpu" => config.aceleracion = Aceleracion::SoloCpu,
+            otro => {
+                eprintln!("Opción desconocida: {otro}");
+                return 2;
+            }
+        }
+    }
+    let compartido = Arc::new(Mutex::new(Compartido {
+        trabajos: vec![trabajo.clone()],
+        ..Default::default()
+    }));
+    let ctx = egui::Context::default();
+    match convertir(&compartido, 0, &trabajo, &config, &ctx) {
+        Ok((salida, nota)) => {
+            println!("OK {} ({nota})", salida.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("ERROR {e}");
+            1
+        }
+    }
+}
+
 fn main() -> eframe::Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("--cli") {
+        // La versión final no tiene consola propia: se usa la de quien la ejecuta.
+        #[cfg(windows)]
+        {
+            unsafe extern "system" {
+                fn AttachConsole(id: u32) -> i32;
+            }
+            unsafe { AttachConsole(u32::MAX) };
+        }
+        std::process::exit(modo_cli(&args[1..]));
+    }
     let opciones = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1060.0, 700.0])
@@ -1911,16 +2089,6 @@ mod pruebas {
         assert_eq!(parsear_tiempo("1:02:03,5"), Ok(Some(3723.5)));
         assert!(parsear_tiempo("1:75").is_err());
         assert!(parsear_tiempo("abc").is_err());
-    }
-
-    #[test]
-    fn srt_renumera_desplaza_y_mayusculas() {
-        let crudo = "0\n00:00:00,000 --> 00:00:01,500\nhola a todos\n\n1\n00:00:01,500 --> 00:00:03,000\nbienvenidos\n\n";
-        let r = procesar_srt(crudo, true, 61.25);
-        assert_eq!(
-            r,
-            "1\n00:01:01,250 --> 00:01:02,750\nHOLA A TODOS\n\n2\n00:01:02,750 --> 00:01:04,250\nBIENVENIDOS\n\n"
-        );
     }
 
     #[test]

@@ -12,9 +12,14 @@ Aplicación de escritorio en Rust para convertir cualquier video a formato verti
   o barras negras. Salida en 1080×1920 o 720×1280.
 - **Recorte por tiempo**: inicio y fin por video (`90`, `1:30`, `1:02:03.5`), y botón
   «Otro clip» para sacar varios fragmentos del mismo video.
-- **Subtítulos automáticos** con [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
-  (integrado en ffmpeg), sin internet ni costo: idioma, precisión (3 modelos), tamaño,
-  posición, color y mayúsculas. Se quedan grabados en el video y opcionalmente en un `.srt`.
+- **Subtítulos automáticos estilo Shorts** con [whisper.cpp](https://github.com/ggerganov/whisper.cpp)
+  (integrado en ffmpeg), sin internet ni costo:
+  - tiempos **por palabra** sincronizados con la voz (se quitan los silencios antes de transcribir
+    y cada palabra vuelve a su tiempo real),
+  - estilos: resaltar la palabra que se dice (karaoke), palabra por palabra o frase simple,
+  - animaciones: pop, deslizar, fundido,
+  - fuentes incluidas: Luckiest Guy, Poppins Black y Anton (licencias en `assets/fonts`),
+  - color de resaltado, tamaño, posición, mayúsculas y vista previa en vivo.
 - **Modo «solo subtítulos»**: genera únicamente el `.srt` del video original.
 - **Aceleración por GPU**: usa NVIDIA NVENC, Intel Quick Sync o AMD AMF si están disponibles;
   si la GPU falla, reintenta automáticamente con la CPU (x264).
@@ -39,6 +44,12 @@ cargo build --release
 ```
 
 El ejecutable queda en `target\release\formato_shorts.exe`.
+
+Modo línea de comandos (útil para automatizar):
+
+```
+FormatoShorts.exe --cli video.mp4 [--inicio 1:30] [--fin 2:10] [--sin-subs] [--solo-srt] [--cpu]
+```
 
 Pruebas:
 
