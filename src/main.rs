@@ -309,6 +309,8 @@ struct Trabajo {
     duracion: Option<f64>,
     inicio: String,
     fin: String,
+    /// Nombre del archivo de salida (sin extensión); si falta, se usa el del video.
+    nombre: Option<String>,
 }
 
 impl Trabajo {
@@ -324,6 +326,7 @@ impl Trabajo {
             duracion,
             inicio: String::new(),
             fin: String::new(),
+            nombre: None,
         }
     }
 
@@ -584,15 +587,18 @@ fn construir_filtro(config: &Config, ass_relativo: Option<&str>) -> String {
 }
 
 /// Ruta de salida única: <carpeta>/<nombre><sufijo>.<ext>
-fn ruta_salida(entrada: &Path, config: &Config, sufijo: &str, ext: &str) -> PathBuf {
+fn ruta_salida(trabajo: &Trabajo, config: &Config, sufijo: &str, ext: &str) -> PathBuf {
+    let entrada = &trabajo.entrada;
     let carpeta = config
         .carpeta_salida
         .clone()
         .unwrap_or_else(|| entrada.parent().map(Path::to_path_buf).unwrap_or_default());
-    let base = entrada
-        .file_stem()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "video".into());
+    let base = trabajo.nombre.clone().unwrap_or_else(|| {
+        entrada
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "video".into())
+    });
     let mut ruta = carpeta.join(format!("{base}{sufijo}.{ext}"));
     let mut n = 2;
     while ruta.exists() {
@@ -1096,13 +1102,13 @@ fn convertir(
             config.subs.aspecto.mayusculas,
             inicio.unwrap_or(0.0),
         );
-        let salida = ruta_salida(entrada, config, "", "srt");
+        let salida = ruta_salida(trabajo, config, "", "srt");
         std::fs::write(&salida, srt).map_err(|e| format!("No se pudo guardar el .srt: {e}"))?;
         return Ok((salida, format!("{} palabras", palabras.len())));
     }
 
     // ── Modo video ──
-    let salida = ruta_salida(entrada, config, "_9x16", "mp4");
+    let salida = ruta_salida(trabajo, config, "_9x16", "mp4");
     let con_subs = config.subs.activar && !palabras.is_empty();
     if con_subs {
         st::instalar_fuentes(&base);
@@ -2009,45 +2015,137 @@ fn mejor_modelo() -> Modelo {
         .unwrap_or(Modelo::Base)
 }
 
-/// Modo línea de comandos:
-///   FormatoShorts.exe --cli <video> [--inicio T] [--fin T] [--sin-subs] [--solo-srt] [--cpu]
+const USO_CLI: &str = "Uso: FormatoShorts.exe --cli <video> [opciones]
+
+  --clip INICIO-FIN   Un clip (se puede repetir para sacar varios). Ej: --clip 0:15-0:45
+  --inicio T --fin T  Un solo clip (forma antigua)
+  --salida CARPETA    Dónde guardar (por defecto: <carpeta del video>/<nombre>_clips)
+  --sin-subs          Sin subtítulos
+  --solo-srt          Solo genera los .srt
+  --cpu               No usar la GPU
+
+Ejemplo:
+  FormatoShorts.exe --cli video.mp4 --clip 0:15-0:45 --clip 1:30-2:10 --clip 5:00-5:40";
+
+/// Modo línea de comandos: genera uno o varios clips 9:16 de un mismo video.
 fn modo_cli(args: &[String]) -> i32 {
-    let Some(entrada) = args.first() else {
-        eprintln!("Uso: --cli <video> [--inicio T] [--fin T] [--sin-subs] [--solo-srt] [--cpu]");
+    let Some(entrada) = args.first().filter(|a| !a.starts_with("--")) else {
+        eprintln!("{USO_CLI}");
         return 2;
     };
+    // ffmpeg se ejecuta desde la carpeta de la app: las rutas deben ser absolutas.
+    let absoluta = |p: PathBuf| std::path::absolute(&p).unwrap_or(p);
+    let entrada = absoluta(PathBuf::from(entrada));
+    if !entrada.is_file() {
+        eprintln!("ERROR no existe el video: {}", entrada.display());
+        return 2;
+    }
     let mut config = config_por_defecto(mejor_modelo());
     config.subs.activar = true;
-    let mut trabajo = Trabajo::nuevo(PathBuf::from(entrada));
+    let mut clips: Vec<(String, String)> = Vec::new();
+    let (mut inicio, mut fin) = (String::new(), String::new());
+    let mut salida: Option<PathBuf> = None;
     let mut it = args[1..].iter();
     while let Some(a) = it.next() {
-        match a.as_str() {
-            "--inicio" => trabajo.inicio = it.next().cloned().unwrap_or_default(),
-            "--fin" => trabajo.fin = it.next().cloned().unwrap_or_default(),
-            "--sin-subs" => config.subs.activar = false,
-            "--solo-srt" => config.que = QueGenerar::SoloSubtitulos,
-            "--cpu" => config.aceleracion = Aceleracion::SoloCpu,
-            otro => {
-                eprintln!("Opción desconocida: {otro}");
-                return 2;
+        let mut valor = |nombre: &str| {
+            it.next()
+                .cloned()
+                .ok_or_else(|| format!("Falta el valor de {nombre}"))
+        };
+        let r: Result<(), String> = (|| {
+            match a.as_str() {
+                "--clip" => {
+                    let v = valor("--clip")?;
+                    let (a, b) = v
+                        .split_once('-')
+                        .ok_or_else(|| format!("Clip no válido «{v}», usa INICIO-FIN (ej. 1:30-2:10)"))?;
+                    clips.push((a.trim().to_string(), b.trim().to_string()));
+                }
+                "--inicio" => inicio = valor("--inicio")?,
+                "--fin" => fin = valor("--fin")?,
+                "--salida" => salida = Some(absoluta(PathBuf::from(valor("--salida")?))),
+                "--sin-subs" => config.subs.activar = false,
+                "--solo-srt" => config.que = QueGenerar::SoloSubtitulos,
+                "--cpu" => config.aceleracion = Aceleracion::SoloCpu,
+                "--ayuda" | "--help" | "-h" => return Err(String::new()),
+                otro => return Err(format!("Opción desconocida: {otro}")),
             }
+            Ok(())
+        })();
+        if let Err(e) = r {
+            if !e.is_empty() {
+                eprintln!("ERROR {e}\n");
+            }
+            eprintln!("{USO_CLI}");
+            return 2;
         }
     }
+    let varios = !clips.is_empty();
+    if !varios {
+        clips.push((inicio, fin));
+    }
+
+    let duracion = probar_video(&entrada).0;
+    let base = entrada
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "video".into());
+    // Con varios clips se guardan en una carpeta propia: <video>_clips
+    let carpeta = salida.or_else(|| {
+        varios.then(|| {
+            entrada
+                .parent()
+                .unwrap_or(Path::new("."))
+                .join(format!("{base}_clips"))
+        })
+    });
+    if let Some(c) = &carpeta {
+        if let Err(e) = std::fs::create_dir_all(c) {
+            eprintln!("ERROR no se pudo crear la carpeta {}: {e}", c.display());
+            return 1;
+        }
+        config.carpeta_salida = Some(c.clone());
+    }
+
+    let trabajos: Vec<Trabajo> = clips
+        .iter()
+        .enumerate()
+        .map(|(n, (ini, fin))| {
+            let mut t = Trabajo::con_duracion(entrada.clone(), duracion);
+            t.inicio = ini.clone();
+            t.fin = fin.clone();
+            if varios {
+                t.nombre = Some(format!("{base}_clip{:02}", n + 1));
+            }
+            t
+        })
+        .collect();
     let compartido = Arc::new(Mutex::new(Compartido {
-        trabajos: vec![trabajo.clone()],
+        trabajos: trabajos.clone(),
         ..Default::default()
     }));
     let ctx = egui::Context::default();
-    match convertir(&compartido, 0, &trabajo, &config, &ctx) {
-        Ok((salida, nota)) => {
-            println!("OK {} ({nota})", salida.display());
-            0
-        }
-        Err(e) => {
-            eprintln!("ERROR {e}");
-            1
+    let total = trabajos.len();
+    let mut fallidos = 0;
+    for (i, t) in trabajos.iter().enumerate() {
+        let rango = format!(
+            "{}-{}",
+            if t.inicio.is_empty() { "inicio" } else { &t.inicio },
+            if t.fin.is_empty() { "fin" } else { &t.fin }
+        );
+        eprintln!("[{}/{total}] {rango} ...", i + 1);
+        match convertir(&compartido, i, t, &config, &ctx) {
+            Ok((ruta, nota)) => println!("OK {} ({nota})", ruta.display()),
+            Err(e) => {
+                fallidos += 1;
+                println!("ERROR clip {} ({rango}): {e}", i + 1);
+            }
         }
     }
+    if let Some(c) = &carpeta {
+        eprintln!("Listo: {} de {total} clips en {}", total - fallidos, c.display());
+    }
+    if fallidos > 0 { 1 } else { 0 }
 }
 
 fn main() -> eframe::Result<()> {

@@ -48,8 +48,14 @@ El ejecutable queda en `target\release\formato_shorts.exe`.
 Modo línea de comandos (útil para automatizar):
 
 ```
-FormatoShorts.exe --cli video.mp4 [--inicio 1:30] [--fin 2:10] [--sin-subs] [--solo-srt] [--cpu]
+FormatoShorts.exe --cli video.mp4 --clip 0:15-0:45 --clip 1:30-2:10 --clip 5:00-5:40
 ```
+
+- `--clip INICIO-FIN` se puede repetir para sacar varios clips del mismo video. Se guardan en
+  `<carpeta del video>\<nombre>_clips\` como `<nombre>_clip01_9x16.mp4`, `_clip02`… (con su `.srt`).
+- `--salida CARPETA` cambia la carpeta de destino.
+- `--inicio T --fin T` para un solo clip; `--sin-subs`, `--solo-srt`, `--cpu`.
+- Imprime `OK <ruta>` o `ERROR ...` por clip; el código de salida es 0 si todos salieron bien.
 
 Pruebas:
 
